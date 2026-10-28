@@ -1,0 +1,8 @@
+// Use the same reviewed Build Tools as the Android patch kit's Docker build.
+allprojects { target ->
+    ["com.android.application", "com.android.library"].each { pluginId ->
+        target.plugins.withId(pluginId) {
+            target.extensions.getByName("android").buildToolsVersion = "37.0.0"
+        }
+    }
+}
