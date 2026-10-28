@@ -1,0 +1,204 @@
+name: Build Bitwarden
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Clients to build
+        type: choice
+        options: [all, clients, browser, browser-chrome, browser-edge, browser-firefox, web, cli, desktop, desktop-linux, desktop-windows, desktop-macos, android]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bitwarden-${{ github.ref }}-all
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: 'true'
+  HUSKY: '0'
+  NG_CLI_ANALYTICS: 'false'
+  NX_DAEMON: 'false'
+  NX_NO_CLOUD: 'true'
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+  HOMEBREW_NO_ANALYTICS: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  POWERSHELL_TELEMETRY_OPTOUT: '1'
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  matrix:
+    name: Prepare builds
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.select.outputs.matrix }}
+      clients: ${{ steps.select.outputs.clients }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: select
+        env:
+          BW_TARGET: ${{ inputs.target || 'all' }}
+        run: python3 scripts/build-matrix.py "$BW_TARGET" >> "$GITHUB_OUTPUT"
+      - name: Test release publishing
+        run: >-
+          docker run --rm --network=none -v "$PWD/scripts:/tests:ro"
+          python:3.12-slim python -B /tests/test-release.py
+      - name: Test Android certificate verification
+        run: >-
+          docker run --rm --network=none -v "$PWD/scripts:/tests:ro"
+          python:3.12-slim python -B /tests/test-android-signing.py
+      - name: Download artifact audit fixture
+        run: |
+          mkdir fixtures
+          curl --fail --silent --show-error --location --max-time 60 \
+            https://raw.githubusercontent.com/bitwarden/android/747801fc0867b7c9f1efedc3802249a458f19619/app/src/main/assets/fido2_privileged_google.json \
+            -o fixtures/fido2_privileged_google.json
+      - name: Test Android artifact audit
+        run: >-
+          docker run --rm --network=none -v "$PWD/scripts:/tests:ro" -v "$PWD/fixtures:/fixtures:ro"
+          -e BITWARDEN_AUDIT_FIXTURE=/fixtures/fido2_privileged_google.json
+          python:3.12-slim python -B /tests/test-artifacts.py
+          ArtifactTests.test_bitwarden_caller_literal_is_scoped_to_valid_dex_and_profile
+          ArtifactTests.test_bitwarden_security_asset_is_pinned
+          ArtifactTests.test_dex_tls_provider_literal_is_not_an_sdk
+          ArtifactTests.test_full_apk_scan_preserves_dex_validation
+
+  privacy-tests:
+    name: Tests
+    needs: matrix
+    if: needs.matrix.outputs.clients == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.17.0'
+      - run: python3 scripts/checkout-source.py clients
+      - name: Prepare source
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh clients prepare
+      - name: Install dependencies
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh clients dependencies
+      - name: Run tests
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh clients tests
+
+  build:
+    permissions:
+      contents: write
+      packages: read
+    needs: [matrix, privacy-tests]
+    if: >-
+      !cancelled() && needs.matrix.result == 'success' &&
+      (needs.privacy-tests.result == 'success' || needs.privacy-tests.result == 'skipped')
+    name: ${{ matrix.id }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      BW_BUILD_APP: ${{ matrix.app }}
+      BW_BUILD_TARGET: ${{ matrix.target }}
+      BW_BUILD_BROWSER: ${{ matrix.browser }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.17.0'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Check out source
+        env:
+          BW_APP: ${{ matrix.app }}
+        run: python3 scripts/checkout-source.py "$BW_APP"
+      - name: Prepare source
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh "$BW_BUILD_APP" prepare
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        if: matrix.app == 'android'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK packages
+        if: matrix.app == 'android'
+        run: |
+          "${ANDROID_HOME:?Android SDK required}/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" --install 'platforms;android-37.0' 'build-tools;37.0.0'
+      - name: Check release signing
+        if: matrix.app == 'android'
+        run: python3 scripts/check-release-signing.py
+      - name: Install Linux desktop dependencies
+        if: matrix.id == 'desktop-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential pkg-config \
+            libxss-dev libsecret-1-dev libdbus-1-dev libudev-dev libx11-dev libxtst-dev libxdo-dev libssl-dev
+      - name: Configure Windows compiler
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./scripts/setup-windows.ps1
+      - name: Install dependencies
+        if: matrix.app == 'clients'
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh "$BW_BUILD_APP" dependencies
+      - name: Build native components
+        if: matrix.target == 'desktop'
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh "$BW_BUILD_APP" native
+      - name: Run Android tests
+        if: matrix.app == 'android'
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/apply-patch.sh android tests
+      - name: Build application
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+          GITHUB_TOKEN: ${{ matrix.app == 'android' && github.token || '' }}
+        run: bash scripts/apply-patch.sh "$BW_BUILD_APP" build
+      - name: Package application
+        env:
+          PATCH_BOOTSTRAP: ${{ secrets.BITWARDEN_CUSTOMIZE_SCRIPT }}
+        run: bash scripts/apply-patch.sh "$BW_BUILD_APP" package
+      - name: Publish package to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE_ID: bitwarden-${{ matrix.id }}-${{ matrix.arch }}
+        run: python3 scripts/publish-release.py
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bitwarden-${{ matrix.id }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean signing material
+        if: always() && matrix.app == 'android'
+        run: |
+          if [[ -n "${ANDROID_SIGNING_STORE:-}" ]]; then rm -f -- "$ANDROID_SIGNING_STORE"; fi

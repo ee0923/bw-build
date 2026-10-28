@@ -1,0 +1,7 @@
+/source/
+/dist/
+/reports/
+/.cache/
+/.env
+/.secrets/
+__pycache__/
